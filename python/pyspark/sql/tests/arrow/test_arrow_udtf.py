@@ -21,10 +21,25 @@ from typing import Iterator, Optional
 from pyspark.errors import PySparkAttributeError
 from pyspark.errors import PythonException
 from pyspark.sql.functions import arrow_udtf, lit
-from pyspark.sql.types import Row, StructType, StructField, IntegerType
+from pyspark.sql.types import (
+    Row,
+    DataType,
+    StructType,
+    StructField,
+    IntegerType,
+    LongType,
+    StringType,
+)
+from pyspark.sql.udtf import (
+    AnalyzeArgument,
+    AnalyzeResult,
+    OrderingColumn,
+    PartitioningColumn,
+    SelectedColumn,
+)
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 from pyspark.testing.utils import have_pyarrow, pyarrow_requirement_message
-from pyspark.testing import assertDataFrameEqual
+from pyspark.testing import assertDataFrameEqual, assertSchemaEqual
 from pyspark.util import is_remote_only
 
 if have_pyarrow:
@@ -479,25 +494,202 @@ class ArrowUDTFTestsMixin:
             result_df = InvalidEmptyResultUDTF()
             result_df.collect()
 
-    def test_arrow_udtf_blocks_analyze_method_none_return_type(self):
-        with self.assertRaises(PySparkAttributeError) as cm:
+    def test_arrow_udtf_with_analyze_zero_args(self):
+        @arrow_udtf
+        class TestUDTF:
+            @staticmethod
+            def analyze() -> AnalyzeResult:
+                return AnalyzeResult(
+                    StructType().add("id", IntegerType()).add("value", StringType())
+                )
 
-            @arrow_udtf
-            class AnalyzeUDTF:
-                def eval(self, input_col: "pa.Array") -> Iterator["pa.Table"]:
-                    yield pa.table({"result": pa.array([1, 2, 3])})
+            def eval(self) -> Iterator["pa.Table"]:
+                yield pa.table(
+                    {
+                        "id": pa.array([1, 2, 3], type=pa.int32()),
+                        "value": pa.array(["a", "b", "c"], type=pa.string()),
+                    }
+                )
 
-                @staticmethod
-                def analyze(arg):
-                    from pyspark.sql.udtf import AnalyzeResult
+        expected_df = self.spark.createDataFrame(
+            [(1, "a"), (2, "b"), (3, "c")], "id int, value string"
+        )
+        assertDataFrameEqual(TestUDTF(), expected_df)
 
-                    return AnalyzeResult(
-                        schema=StructType([StructField("result", IntegerType(), True)])
+        self.spark.udtf.register("test_analyze_zero_args_udtf", TestUDTF)
+        assertDataFrameEqual(
+            self.spark.sql("SELECT * FROM test_analyze_zero_args_udtf()"), expected_df
+        )
+
+    def test_arrow_udtf_with_analyze_scalar_arg(self):
+        # The output schema is computed dynamically from the argument's data type (polymorphism).
+        @arrow_udtf
+        class TestUDTF:
+            @staticmethod
+            def analyze(a: AnalyzeArgument) -> AnalyzeResult:
+                assert isinstance(a, AnalyzeArgument)
+                assert isinstance(a.dataType, DataType)
+                assert a.isTable is False
+                return AnalyzeResult(StructType().add("a", a.dataType))
+
+            def eval(self, a: "pa.Array") -> Iterator["pa.Table"]:
+                assert isinstance(a, pa.Array), f"Expected pa.Array, got {type(a)}"
+                yield pa.table({"a": a})
+
+        self.spark.udtf.register("test_analyze_scalar_udtf", TestUDTF)
+
+        for i, (df, expected_schema, expected_results) in enumerate(
+            [
+                (TestUDTF(lit(1)), StructType().add("a", IntegerType()), [Row(a=1)]),
+                (TestUDTF(lit("x")), StructType().add("a", StringType()), [Row(a="x")]),
+                (
+                    self.spark.sql("SELECT * FROM test_analyze_scalar_udtf(1)"),
+                    StructType().add("a", IntegerType()),
+                    [Row(a=1)],
+                ),
+            ]
+        ):
+            with self.subTest(query_no=i):
+                assertSchemaEqual(df.schema, expected_schema)
+                assertDataFrameEqual(df, expected_results)
+
+    def test_arrow_udtf_with_analyze_multiple_arguments(self):
+        @arrow_udtf
+        class TestUDTF:
+            @staticmethod
+            def analyze(a: AnalyzeArgument, b: AnalyzeArgument) -> AnalyzeResult:
+                return AnalyzeResult(StructType().add("a", a.dataType).add("b", b.dataType))
+
+            def eval(self, a: "pa.Array", b: "pa.Array") -> Iterator["pa.Table"]:
+                yield pa.table({"a": a, "b": b})
+
+        self.spark.udtf.register("test_analyze_multi_args_udtf", TestUDTF)
+
+        for i, df in enumerate(
+            [
+                TestUDTF(lit(1), lit("x")),
+                self.spark.sql("SELECT * FROM test_analyze_multi_args_udtf(1, 'x')"),
+            ]
+        ):
+            with self.subTest(query_no=i):
+                assertSchemaEqual(
+                    df.schema, StructType().add("a", IntegerType()).add("b", StringType())
+                )
+                assertDataFrameEqual(df, [Row(a=1, b="x")])
+
+    def test_arrow_udtf_with_analyze_table_argument(self):
+        # The output schema is derived from the input table's schema.
+        @arrow_udtf
+        class TestUDTF:
+            @staticmethod
+            def analyze(a: AnalyzeArgument) -> AnalyzeResult:
+                assert isinstance(a.dataType, StructType)
+                assert a.isTable is True
+                assert a.isConstantExpression is False
+                return AnalyzeResult(StructType().add("a", a.dataType[0].dataType))
+
+            def eval(self, table_data: "pa.RecordBatch") -> Iterator["pa.Table"]:
+                assert isinstance(table_data, pa.RecordBatch)
+                table = pa.table(table_data)
+                mask = pc.greater(table.column("id"), pa.scalar(5))
+                filtered = table.filter(mask)
+                if filtered.num_rows > 0:
+                    yield pa.table({"a": filtered.column("id")})
+
+        self.spark.udtf.register("test_analyze_table_udtf", TestUDTF)
+        df = self.spark.sql(
+            "SELECT * FROM test_analyze_table_udtf(TABLE (SELECT id FROM range(0, 8)))"
+        )
+        assertSchemaEqual(df.schema, StructType().add("a", LongType()))
+        assertDataFrameEqual(df, [Row(a=6), Row(a=7)])
+
+    def test_arrow_udtf_with_analyze_partition_by(self):
+        # `analyze` requests PARTITION BY so each partition is delivered to a fresh instance.
+        @arrow_udtf
+        class SumUDTF:
+            def __init__(self):
+                self._partition_key = None
+                self._sum = 0
+
+            @staticmethod
+            def analyze(a: AnalyzeArgument) -> AnalyzeResult:
+                return AnalyzeResult(
+                    StructType().add("partition_key", IntegerType()).add("sum_value", LongType()),
+                    partitionBy=[PartitioningColumn("partition_key")],
+                )
+
+            def eval(self, table_data: "pa.RecordBatch") -> Iterator["pa.Table"]:
+                table = pa.table(table_data)
+                keys = pc.unique(table["partition_key"]).to_pylist()
+                assert len(keys) == 1, f"Expected exactly one partition key, got {keys}"
+                self._partition_key = keys[0]
+                self._sum += pc.sum(table["value"]).as_py()
+                return iter(())
+
+            def terminate(self) -> Iterator["pa.Table"]:
+                if self._partition_key is not None:
+                    yield pa.table(
+                        {
+                            "partition_key": pa.array([self._partition_key], type=pa.int32()),
+                            "sum_value": pa.array([self._sum], type=pa.int64()),
+                        }
                     )
 
-        self.assertIn("INVALID_ARROW_UDTF_WITH_ANALYZE", str(cm.exception))
+        test_data = [(1, 10), (2, 5), (1, 20), (2, 15), (1, 30), (3, 100)]
+        input_df = self.spark.createDataFrame(test_data, "partition_key int, value int")
+        self.spark.udtf.register("test_analyze_partition_udtf", SumUDTF)
+        input_df.createOrReplaceTempView("test_analyze_partition_data")
 
-    def test_arrow_udtf_blocks_analyze_method_with_return_type(self):
+        result_df = self.spark.sql(
+            "SELECT * FROM test_analyze_partition_udtf(TABLE(test_analyze_partition_data))"
+        )
+        expected_df = self.spark.createDataFrame(
+            [(1, 60), (2, 20), (3, 100)], "partition_key int, sum_value bigint"
+        )
+        assertDataFrameEqual(result_df, expected_df)
+
+    def test_arrow_udtf_with_analyze_table_select(self):
+        # `analyze` requests a subset of the input table columns via `select`.
+        @arrow_udtf
+        class TestUDTF:
+            @staticmethod
+            def analyze(a: AnalyzeArgument) -> AnalyzeResult:
+                return AnalyzeResult(
+                    StructType().add("id", LongType()), select=[SelectedColumn("id")]
+                )
+
+            def eval(self, table_data: "pa.RecordBatch") -> Iterator["pa.Table"]:
+                table = pa.table(table_data)
+                assert table.column_names == ["id"], (
+                    f"Expected only the selected 'id' column, got {table.column_names}"
+                )
+                yield pa.table({"id": table.column("id")})
+
+        df = self.spark.createDataFrame([(1, "a"), (2, "b"), (3, "c")], ["id", "value"])
+        assertDataFrameEqual(
+            TestUDTF(df.asTable()), [Row(id=1), Row(id=2), Row(id=3)]
+        )
+
+    def test_arrow_udtf_with_analyze_result_in_init(self):
+        # The `__init__` method may accept the AnalyzeResult produced by `analyze`.
+        @arrow_udtf
+        class TestUDTF:
+            def __init__(self, analyze_result=None):
+                assert analyze_result is not None
+                self._schema = analyze_result.schema
+
+            @staticmethod
+            def analyze(a: AnalyzeArgument) -> AnalyzeResult:
+                return AnalyzeResult(StructType().add("a", a.dataType))
+
+            def eval(self, a: "pa.Array") -> Iterator["pa.Table"]:
+                assert self._schema == StructType().add("a", IntegerType())
+                yield pa.table({"a": a})
+
+        expected_df = self.spark.createDataFrame([(1,)], "a int")
+        assertDataFrameEqual(TestUDTF(lit(1)), expected_df)
+
+    def test_arrow_udtf_with_both_return_type_and_analyze(self):
         with self.assertRaises(PySparkAttributeError) as cm:
 
             @arrow_udtf(returnType="result: int")
@@ -507,13 +699,177 @@ class ArrowUDTFTestsMixin:
 
                 @staticmethod
                 def analyze(arg):
-                    from pyspark.sql.udtf import AnalyzeResult
-
                     return AnalyzeResult(
                         schema=StructType([StructField("result", IntegerType(), True)])
                     )
 
         self.assertIn("INVALID_UDTF_BOTH_RETURN_TYPE_AND_ANALYZE", str(cm.exception))
+
+    def test_arrow_udtf_with_neither_return_type_nor_analyze(self):
+        with self.assertRaises(PySparkAttributeError) as cm:
+
+            @arrow_udtf
+            class NoSchemaUDTF:
+                def eval(self, input_col: "pa.Array") -> Iterator["pa.Table"]:
+                    yield pa.table({"result": pa.array([1, 2, 3])})
+
+        self.assertIn("INVALID_UDTF_RETURN_TYPE", str(cm.exception))
+
+    def test_arrow_udtf_with_analyze_with_single_partition(self):
+        # `analyze` requests WITH SINGLE PARTITION and an input ordering: every row is routed to
+        # a single instance, sorted by "input".
+        @arrow_udtf
+        class TestUDTF:
+            def __init__(self):
+                self._count = 0
+                self._sum = 0
+                self._last = None
+
+            @staticmethod
+            def analyze(*args: AnalyzeArgument) -> AnalyzeResult:
+                return AnalyzeResult(
+                    schema=StructType()
+                    .add("count", IntegerType())
+                    .add("total", LongType())
+                    .add("last", IntegerType()),
+                    withSinglePartition=True,
+                    orderBy=[OrderingColumn("input")],
+                )
+
+            def eval(self, table_data: "pa.RecordBatch") -> Iterator["pa.Table"]:
+                table = pa.table(table_data)
+                for v in table.column("input").to_pylist():
+                    # Rows must arrive in ascending order of "input".
+                    assert self._last is None or self._last <= v, (
+                        f"rows not ordered: {self._last} then {v}"
+                    )
+                    self._count += 1
+                    self._last = v
+                    self._sum += v
+                return iter(())
+
+            def terminate(self) -> Iterator["pa.Table"]:
+                yield pa.table(
+                    {
+                        "count": pa.array([self._count], type=pa.int32()),
+                        "total": pa.array([self._sum], type=pa.int64()),
+                        "last": pa.array([self._last], type=pa.int32()),
+                    }
+                )
+
+        self.spark.udtf.register("test_analyze_single_partition_udtf", TestUDTF)
+        query = """
+            WITH t AS (
+              SELECT id AS partition_col, 1 AS input FROM range(1, 21)
+              UNION ALL
+              SELECT id AS partition_col, 2 AS input FROM range(1, 21)
+            )
+            SELECT count, total, last FROM test_analyze_single_partition_udtf(TABLE(t))
+        """
+        assertDataFrameEqual(self.spark.sql(query), [Row(count=40, total=60, last=2)])
+
+    def test_arrow_udtf_with_analyze_partition_by_and_order_by(self):
+        # `analyze` requests PARTITION BY partition_col ORDER BY input: each partition reaches a
+        # fresh instance with its rows sorted ascending.
+        @arrow_udtf
+        class TestUDTF:
+            def __init__(self):
+                self._partition_col = None
+                self._count = 0
+                self._sum = 0
+                self._last = None
+
+            @staticmethod
+            def analyze(*args: AnalyzeArgument) -> AnalyzeResult:
+                return AnalyzeResult(
+                    schema=StructType()
+                    .add("partition_col", IntegerType())
+                    .add("count", IntegerType())
+                    .add("total", IntegerType())
+                    .add("last", IntegerType()),
+                    partitionBy=[PartitioningColumn("partition_col")],
+                    orderBy=[OrderingColumn(name="input", ascending=True)],
+                )
+
+            def eval(self, table_data: "pa.RecordBatch") -> Iterator["pa.Table"]:
+                table = pa.table(table_data)
+                keys = pc.unique(table.column("partition_col")).to_pylist()
+                # Every row consumed by this instance belongs to the same partition.
+                assert len(keys) == 1, f"Expected one partition key, got {keys}"
+                assert self._partition_col is None or self._partition_col == keys[0]
+                self._partition_col = keys[0]
+                for v in table.column("input").to_pylist():
+                    assert self._last is None or self._last <= v, (
+                        f"rows not ordered: {self._last} then {v}"
+                    )
+                    self._count += 1
+                    self._last = v
+                    self._sum += v
+                return iter(())
+
+            def terminate(self) -> Iterator["pa.Table"]:
+                yield pa.table(
+                    {
+                        "partition_col": pa.array([self._partition_col], type=pa.int32()),
+                        "count": pa.array([self._count], type=pa.int32()),
+                        "total": pa.array([self._sum], type=pa.int32()),
+                        "last": pa.array([self._last], type=pa.int32()),
+                    }
+                )
+
+        # Each partition has the values [3, 1, 2]; ORDER BY input must turn them into [1, 2, 3].
+        test_data = [(p, v) for p in range(1, 6) for v in [3, 1, 2]]
+        input_df = self.spark.createDataFrame(test_data, "partition_col int, input int")
+        self.spark.udtf.register("test_analyze_partition_order_udtf", TestUDTF)
+        input_df.createOrReplaceTempView("test_analyze_partition_order_data")
+
+        result_df = self.spark.sql(
+            """
+            SELECT * FROM test_analyze_partition_order_udtf(
+                TABLE(test_analyze_partition_order_data))
+            """
+        )
+        expected_df = self.spark.createDataFrame(
+            [(p, 3, 6, 3) for p in range(1, 6)],
+            "partition_col int, count int, total int, last int",
+        )
+        assertDataFrameEqual(result_df, expected_df)
+
+    def test_arrow_udtf_with_analyze_kwargs(self):
+        # Named (keyword) arguments are passed through to both `analyze` and `eval`.
+        @arrow_udtf
+        class TestUDTF:
+            @staticmethod
+            def analyze(**kwargs: AnalyzeArgument) -> AnalyzeResult:
+                assert isinstance(kwargs["a"].dataType, IntegerType)
+                assert kwargs["a"].value == 10
+                assert kwargs["a"].isTable is False
+                assert isinstance(kwargs["b"].dataType, StringType)
+                assert kwargs["b"].value == "x"
+                return AnalyzeResult(
+                    StructType(
+                        [StructField(key, arg.dataType) for key, arg in sorted(kwargs.items())]
+                    )
+                )
+
+            def eval(self, **kwargs: "pa.Array") -> Iterator["pa.Table"]:
+                yield pa.table({key: kwargs[key] for key in sorted(kwargs)})
+
+        self.spark.udtf.register("test_analyze_kwargs_udtf", TestUDTF)
+
+        for i, df in enumerate(
+            [
+                self.spark.sql("SELECT * FROM test_analyze_kwargs_udtf(a => 10, b => 'x')"),
+                self.spark.sql("SELECT * FROM test_analyze_kwargs_udtf(b => 'x', a => 10)"),
+                TestUDTF(a=lit(10), b=lit("x")),
+                TestUDTF(b=lit("x"), a=lit(10)),
+            ]
+        ):
+            with self.subTest(query_no=i):
+                assertSchemaEqual(
+                    df.schema, StructType().add("a", IntegerType()).add("b", StringType())
+                )
+                assertDataFrameEqual(df, [Row(a=10, b="x")])
 
     def test_arrow_udtf_with_table_argument_basic(self):
         @arrow_udtf(returnType="filtered_id bigint")  # Use bigint to match int64

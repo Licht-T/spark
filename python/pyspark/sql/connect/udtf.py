@@ -19,7 +19,7 @@ User-defined table function related classes and functions
 """
 
 import warnings
-from typing import List, Type, TYPE_CHECKING, Optional, Union, Any
+from typing import List, Type, TYPE_CHECKING, Optional, Union
 
 from pyspark.util import PythonEvalType
 from pyspark.sql.connect.column import Column
@@ -35,7 +35,7 @@ from pyspark.sql.pandas.utils import require_minimum_pyarrow_version, require_mi
 from pyspark.sql.udtf import AnalyzeArgument, AnalyzeResult  # noqa: F401
 from pyspark.sql.udtf import UDTFRegistration as PySparkUDTFRegistration, _validate_udtf_handler
 from pyspark.sql.types import DataType, StructType
-from pyspark.errors import PySparkRuntimeError, PySparkTypeError, PySparkAttributeError
+from pyspark.errors import PySparkRuntimeError, PySparkTypeError
 
 if TYPE_CHECKING:
     from pyspark.sql.connect._typing import ColumnOrName
@@ -108,8 +108,9 @@ def _create_pyarrow_udtf(
     # Validate PyArrow dependencies
     require_minimum_pyarrow_version()
 
-    # Validate the handler class with PyArrow-specific checks
-    _validate_arrow_udtf_handler(cls, returnType)
+    # Arrow UDTFs share the same handler validation as regular UDTFs, including support for
+    # the polymorphic `analyze` static method (dynamic return types).
+    _validate_udtf_handler(cls, returnType)
 
     return _create_udtf(
         cls=cls,
@@ -118,21 +119,6 @@ def _create_pyarrow_udtf(
         evalType=PythonEvalType.SQL_ARROW_UDTF,
         deterministic=deterministic,
     )
-
-
-def _validate_arrow_udtf_handler(cls: Any, returnType: Optional[Union[StructType, str]]) -> None:
-    """Validate the handler class of a PyArrow UDTF."""
-    # First run standard UDTF validation
-    _validate_udtf_handler(cls, returnType)
-
-    # Block analyze method usage in arrow UDTFs
-    # TODO(SPARK-53286): Support analyze method for Arrow UDTFs to enable dynamic return types
-    has_analyze = hasattr(cls, "analyze")
-    if has_analyze:
-        raise PySparkAttributeError(
-            errorClass="INVALID_ARROW_UDTF_WITH_ANALYZE",
-            messageParameters={"name": cls.__name__},
-        )
 
 
 class UserDefinedTableFunction:

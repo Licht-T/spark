@@ -380,11 +380,6 @@
       "Arrow UDTFs with PARTITION BY must have a TABLE argument that results in a PyArrow RecordBatch, but got <actual_type>."
     ]
   },
-  "INVALID_ARROW_UDTF_WITH_ANALYZE": {
-    "message": [
-      "The arrow UDTF '<name>' is invalid. Arrow UDTFs do not support the 'analyze' method. Please remove the 'analyze' method from '<name>' and specify a returnType instead."
-    ]
-  },
   "INVALID_BROADCAST_OPERATION": {
     "message": [
       "Broadcast can only be <operation> in driver."

@@ -261,8 +261,9 @@ def _create_pyarrow_udtf(
     except ImportError as e:
         raise PySparkImportError(f"PyArrow UDTF requires pyarrow dependencies: {str(e)}") from e
 
-    # Validate the handler class with PyArrow-specific checks
-    _validate_arrow_udtf_handler(cls, returnType)
+    # Arrow UDTFs share the same handler validation as regular UDTFs, including support for
+    # the polymorphic `analyze` static method (dynamic return types).
+    _validate_udtf_handler(cls, returnType)
 
     return _create_udtf(
         cls=cls,
@@ -271,21 +272,6 @@ def _create_pyarrow_udtf(
         evalType=PythonEvalType.SQL_ARROW_UDTF,
         deterministic=deterministic,
     )
-
-
-def _validate_arrow_udtf_handler(cls: Any, returnType: Optional[Union[StructType, str]]) -> None:
-    """Validate the handler class of a PyArrow UDTF."""
-    # First run standard UDTF validation
-    _validate_udtf_handler(cls, returnType)
-
-    # Block analyze method usage in arrow UDTFs
-    # TODO(SPARK-53286): Support analyze method for Arrow UDTFs to enable dynamic return types
-    has_analyze = hasattr(cls, "analyze")
-    if has_analyze:
-        raise PySparkAttributeError(
-            errorClass="INVALID_ARROW_UDTF_WITH_ANALYZE",
-            messageParameters={"name": cls.__name__},
-        )
 
 
 def _validate_udtf_handler(cls: Any, returnType: Optional[Union[StructType, str]]) -> None:

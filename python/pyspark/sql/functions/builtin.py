@@ -31200,6 +31200,9 @@ def arrow_udtf(
     returnType : :class:`pyspark.sql.types.StructType` or str, optional
         the return type of the user-defined table function. The value can be either a
         :class:`pyspark.sql.types.StructType` object or a DDL-formatted struct type string.
+        This may be omitted when the handler class defines a static ``analyze`` method that
+        computes the return type dynamically from the call arguments (a polymorphic UDTF).
+        Specifying both ``returnType`` and an ``analyze`` method is not allowed.
 
     Examples
     --------
@@ -31236,10 +31239,26 @@ def arrow_udtf(
     ...
     >>> MyUDTF2(lit(1), lit(2)).show()  # doctest: +SKIP
 
+    Polymorphic UDTF whose return type is computed by a static ``analyze`` method:
+
+    >>> from pyspark.sql.udtf import AnalyzeArgument, AnalyzeResult
+    >>> from pyspark.sql.types import StructType
+    >>> @arrow_udtf
+    ... class MyPolymorphicUDTF:
+    ...     @staticmethod
+    ...     def analyze(t: AnalyzeArgument) -> AnalyzeResult:
+    ...         # Derive the output schema from the input table schema.
+    ...         return AnalyzeResult(schema=t.dataType)
+    ...     def eval(self, batch: pa.RecordBatch):
+    ...         yield pa.table(batch)
+    ...
+    >>> MyPolymorphicUDTF(df.asTable()).show()  # doctest: +SKIP
+
     Notes
     -----
     - The eval method must accept PyArrow RecordBatches or Arrays as input
     - The eval method must yield PyArrow Tables or RecordBatches as output
+    - Either ``returnType`` or a static ``analyze`` method must be provided, but not both
     """
     if cls is None:
         return functools.partial(_create_pyarrow_udtf, returnType=returnType)
